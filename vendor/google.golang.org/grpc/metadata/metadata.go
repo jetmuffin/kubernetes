@@ -19,13 +19,12 @@
 // Package metadata define the structure of the metadata supported by gRPC library.
 // Please refer to https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md
 // for more information about custom-metadata.
-package metadata
+package metadata // import "google.golang.org/grpc/metadata"
 
 import (
+	"context"
 	"fmt"
 	"strings"
-
-	"golang.org/x/net/context"
 )
 
 // DecodeKeyValue returns k, v, nil.
@@ -76,13 +75,9 @@ func Pairs(kv ...string) MD {
 		panic(fmt.Sprintf("metadata: Pairs got the odd number of input pairs for metadata: %d", len(kv)))
 	}
 	md := MD{}
-	var key string
-	for i, s := range kv {
-		if i%2 == 0 {
-			key = strings.ToLower(s)
-			continue
-		}
-		md[key] = append(md[key], s)
+	for i := 0; i < len(kv); i += 2 {
+		key := strings.ToLower(kv[i])
+		md[key] = append(md[key], kv[i+1])
 	}
 	return md
 }
@@ -196,12 +191,18 @@ func FromOutgoingContext(ctx context.Context) (MD, bool) {
 		return nil, false
 	}
 
-	mds := make([]MD, 0, len(raw.added)+1)
-	mds = append(mds, raw.md)
-	for _, vv := range raw.added {
-		mds = append(mds, Pairs(vv...))
+	out := raw.md.Copy()
+	for _, added := range raw.added {
+		if len(added)%2 == 1 {
+			panic(fmt.Sprintf("metadata: FromOutgoingContext got an odd number of input pairs for metadata: %d", len(added)))
+		}
+
+		for i := 0; i < len(added); i += 2 {
+			key := strings.ToLower(added[i])
+			out[key] = append(out[key], added[i+1])
+		}
 	}
-	return Join(mds...), ok
+	return out, ok
 }
 
 type rawMD struct {

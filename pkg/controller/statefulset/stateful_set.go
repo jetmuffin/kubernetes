@@ -17,17 +17,19 @@ limitations under the License.
 package statefulset
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"time"
 
 	apps "k8s.io/api/apps/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
@@ -38,15 +40,12 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/history"
+	"k8s.io/kubernetes/pkg/features"
 
-	"k8s.io/klog"
-)
-
-const (
-	// period to relist statefulsets and verify pets
-	statefulSetResyncPeriod = 30 * time.Second
+	"k8s.io/klog/v2"
 )
 
 // controllerKind contains the schema.GroupVersionKind for this controller type.
@@ -86,10 +85,9 @@ func NewStatefulSetController(
 	kubeClient clientset.Interface,
 ) *StatefulSetController {
 	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartLogging(klog.Infof)
+	eventBroadcaster.StartStructuredLogging(0)
 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "statefulset-controller"})
-
 	ssc := &StatefulSetController{
 		kubeClient: kubeClient,
 		control: NewDefaultStatefulSetControl(
@@ -121,7 +119,7 @@ func NewStatefulSetController(
 	ssc.podLister = podInformer.Lister()
 	ssc.podListerSynced = podInformer.Informer().HasSynced
 
-	setInformer.Informer().AddEventHandlerWithResyncPeriod(
+	setInformer.Informer().AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: ssc.enqueueStatefulSet,
 			UpdateFunc: func(old, cur interface{}) {
@@ -134,7 +132,6 @@ func NewStatefulSetController(
 			},
 			DeleteFunc: ssc.enqueueStatefulSet,
 		},
-		statefulSetResyncPeriod,
 	)
 	ssc.setLister = setInformer.Lister()
 	ssc.setListerSynced = setInformer.Informer().HasSynced
@@ -151,7 +148,7 @@ func (ssc *StatefulSetController) Run(workers int, stopCh <-chan struct{}) {
 	klog.Infof("Starting stateful set controller")
 	defer klog.Infof("Shutting down statefulset controller")
 
-	if !controller.WaitForCacheSync("stateful set", stopCh, ssc.podListerSynced, ssc.setListerSynced, ssc.pvcListerSynced, ssc.revListerSynced) {
+	if !cache.WaitForNamedCacheSync("stateful set", stopCh, ssc.podListerSynced, ssc.setListerSynced, ssc.pvcListerSynced, ssc.revListerSynced) {
 		return
 	}
 
@@ -201,7 +198,7 @@ func (ssc *StatefulSetController) updatePod(old, cur interface{}) {
 	curPod := cur.(*v1.Pod)
 	oldPod := old.(*v1.Pod)
 	if curPod.ResourceVersion == oldPod.ResourceVersion {
-		// Periodic resync will send update events for all known pods.
+		// In the event of a re-list we may receive update events for all known pods.
 		// Two different versions of the same pod will always have different RVs.
 		return
 	}
@@ -226,6 +223,15 @@ func (ssc *StatefulSetController) updatePod(old, cur interface{}) {
 		}
 		klog.V(4).Infof("Pod %s updated, objectMeta %+v -> %+v.", curPod.Name, oldPod.ObjectMeta, curPod.ObjectMeta)
 		ssc.enqueueStatefulSet(set)
+		// TODO: MinReadySeconds in the Pod will generate an Available condition to be added in
+		// the Pod status which in turn will trigger a requeue of the owning replica set thus
+		// having its status updated with the newly available replica.
+		if utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetMinReadySeconds) && !podutil.IsPodReady(oldPod) && podutil.IsPodReady(curPod) && set.Spec.MinReadySeconds > 0 {
+			klog.V(2).Infof("StatefulSet %s will be enqueued after %ds for availability check", set.Name, set.Spec.MinReadySeconds)
+			// Add a second to avoid milliseconds skew in AddAfter.
+			// See https://github.com/kubernetes/kubernetes/issues/39785#issuecomment-279959133 for more info.
+			ssc.enqueueSSAfter(set, (time.Duration(set.Spec.MinReadySeconds)*time.Second)+time.Second)
+		}
 		return
 	}
 
@@ -249,8 +255,7 @@ func (ssc *StatefulSetController) deletePod(obj interface{}) {
 
 	// When a delete is dropped, the relist will notice a pod in the store not
 	// in the list, leading to the insertion of a tombstone object which contains
-	// the deleted key/value. Note that this value might be stale. If the pod
-	// changed labels the new StatefulSet will not be woken up till the periodic resync.
+	// the deleted key/value. Note that this value might be stale.
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
@@ -295,10 +300,15 @@ func (ssc *StatefulSetController) getPodsForStatefulSet(set *apps.StatefulSet, s
 		return isMemberOf(set, pod)
 	}
 
-	// If any adoptions are attempted, we should first recheck for deletion with
-	// an uncached quorum read sometime after listing Pods (see #42639).
-	canAdoptFunc := controller.RecheckDeletionTimestamp(func() (metav1.Object, error) {
-		fresh, err := ssc.kubeClient.AppsV1().StatefulSets(set.Namespace).Get(set.Name, metav1.GetOptions{})
+	cm := controller.NewPodControllerRefManager(ssc.podControl, set, selector, controllerKind, ssc.canAdoptFunc(set))
+	return cm.ClaimPods(pods, filter)
+}
+
+// If any adoptions are attempted, we should first recheck for deletion with
+// an uncached quorum read sometime after listing Pods/ControllerRevisions (see #42639).
+func (ssc *StatefulSetController) canAdoptFunc(set *apps.StatefulSet) func() error {
+	return controller.RecheckDeletionTimestamp(func() (metav1.Object, error) {
+		fresh, err := ssc.kubeClient.AppsV1().StatefulSets(set.Namespace).Get(context.TODO(), set.Name, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -307,9 +317,6 @@ func (ssc *StatefulSetController) getPodsForStatefulSet(set *apps.StatefulSet, s
 		}
 		return fresh, nil
 	})
-
-	cm := controller.NewPodControllerRefManager(ssc.podControl, set, selector, controllerKind, canAdoptFunc)
-	return cm.ClaimPods(pods, filter)
 }
 
 // adoptOrphanRevisions adopts any orphaned ControllerRevisions matched by set's Selector.
@@ -318,22 +325,18 @@ func (ssc *StatefulSetController) adoptOrphanRevisions(set *apps.StatefulSet) er
 	if err != nil {
 		return err
 	}
-	hasOrphans := false
+	orphanRevisions := make([]*apps.ControllerRevision, 0)
 	for i := range revisions {
 		if metav1.GetControllerOf(revisions[i]) == nil {
-			hasOrphans = true
-			break
+			orphanRevisions = append(orphanRevisions, revisions[i])
 		}
 	}
-	if hasOrphans {
-		fresh, err := ssc.kubeClient.AppsV1().StatefulSets(set.Namespace).Get(set.Name, metav1.GetOptions{})
-		if err != nil {
-			return err
+	if len(orphanRevisions) > 0 {
+		canAdoptErr := ssc.canAdoptFunc(set)()
+		if canAdoptErr != nil {
+			return fmt.Errorf("can't adopt ControllerRevisions: %v", canAdoptErr)
 		}
-		if fresh.UID != set.UID {
-			return fmt.Errorf("original StatefulSet %v/%v is gone: got uid %v, wanted %v", set.Namespace, set.Name, fresh.UID, set.UID)
-		}
-		return ssc.control.AdoptOrphanRevisions(set, revisions)
+		return ssc.control.AdoptOrphanRevisions(set, orphanRevisions)
 	}
 	return nil
 }
@@ -382,10 +385,20 @@ func (ssc *StatefulSetController) resolveControllerRef(namespace string, control
 func (ssc *StatefulSetController) enqueueStatefulSet(obj interface{}) {
 	key, err := controller.KeyFunc(obj)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", obj, err))
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %+v: %v", obj, err))
 		return
 	}
 	ssc.queue.Add(key)
+}
+
+// enqueueStatefulSet enqueues the given statefulset in the work queue after given time
+func (ssc *StatefulSetController) enqueueSSAfter(ss *apps.StatefulSet, duration time.Duration) {
+	key, err := controller.KeyFunc(ss)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", ss, err))
+		return
+	}
+	ssc.queue.AddAfter(key, duration)
 }
 
 // processNextWorkItem dequeues items, processes them, and marks them done. It enforces that the syncHandler is never
@@ -397,7 +410,7 @@ func (ssc *StatefulSetController) processNextWorkItem() bool {
 	}
 	defer ssc.queue.Done(key)
 	if err := ssc.sync(key.(string)); err != nil {
-		utilruntime.HandleError(fmt.Errorf("Error syncing StatefulSet %v, requeuing: %v", key.(string), err))
+		utilruntime.HandleError(fmt.Errorf("error syncing StatefulSet %v, requeuing: %v", key.(string), err))
 		ssc.queue.AddRateLimited(key)
 	} else {
 		ssc.queue.Forget(key)
@@ -454,10 +467,18 @@ func (ssc *StatefulSetController) sync(key string) error {
 // syncStatefulSet syncs a tuple of (statefulset, []*v1.Pod).
 func (ssc *StatefulSetController) syncStatefulSet(set *apps.StatefulSet, pods []*v1.Pod) error {
 	klog.V(4).Infof("Syncing StatefulSet %v/%v with %d pods", set.Namespace, set.Name, len(pods))
+	var status *apps.StatefulSetStatus
+	var err error
 	// TODO: investigate where we mutate the set during the update as it is not obvious.
-	if err := ssc.control.UpdateStatefulSet(set.DeepCopy(), pods); err != nil {
+	status, err = ssc.control.UpdateStatefulSet(set.DeepCopy(), pods)
+	if err != nil {
 		return err
 	}
 	klog.V(4).Infof("Successfully synced StatefulSet %s/%s successful", set.Namespace, set.Name)
+	// One more sync to handle the clock skew. This is also helping in requeuing right after status update
+	if utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetMinReadySeconds) && set.Spec.MinReadySeconds > 0 && status != nil && status.AvailableReplicas != *set.Spec.Replicas {
+		ssc.enqueueSSAfter(set, time.Duration(set.Spec.MinReadySeconds)*time.Second)
+	}
+
 	return nil
 }

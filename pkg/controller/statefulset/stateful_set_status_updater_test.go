@@ -20,15 +20,16 @@ import (
 	"errors"
 	"testing"
 
+	apps "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
-
-	core "k8s.io/client-go/testing"
-	"k8s.io/client-go/tools/cache"
-
-	apps "k8s.io/api/apps/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes/fake"
 	appslisters "k8s.io/client-go/listers/apps/v1"
+	core "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 func TestStatefulSetUpdaterUpdatesSetStatus(t *testing.T) {
@@ -95,10 +96,10 @@ func TestStatefulSetStatusUpdaterUpdateReplicasConflict(t *testing.T) {
 		update := action.(core.UpdateAction)
 		if !conflict {
 			conflict = true
-			return true, update.GetObject(), apierrors.NewConflict(action.GetResource().GroupResource(), set.Name, errors.New("Object already exists"))
-		} else {
-			return true, update.GetObject(), nil
+			return true, update.GetObject(), apierrors.NewConflict(action.GetResource().GroupResource(), set.Name, errors.New("object already exists"))
 		}
+		return true, update.GetObject(), nil
+
 	})
 	if err := updater.UpdateStatefulSetStatus(set, &status); err != nil {
 		t.Errorf("UpdateStatefulSetStatus returned an error: %s", err)
@@ -118,9 +119,27 @@ func TestStatefulSetStatusUpdaterUpdateReplicasConflictFailure(t *testing.T) {
 	updater := NewRealStatefulSetStatusUpdater(fakeClient, setLister)
 	fakeClient.AddReactor("update", "statefulsets", func(action core.Action) (bool, runtime.Object, error) {
 		update := action.(core.UpdateAction)
-		return true, update.GetObject(), apierrors.NewConflict(action.GetResource().GroupResource(), set.Name, errors.New("Object already exists"))
+		return true, update.GetObject(), apierrors.NewConflict(action.GetResource().GroupResource(), set.Name, errors.New("object already exists"))
 	})
 	if err := updater.UpdateStatefulSetStatus(set, &status); err == nil {
 		t.Error("UpdateStatefulSetStatus failed to return an error on get failure")
+	}
+}
+
+func TestStatefulSetStatusUpdaterGetAvailableReplicas(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StatefulSetMinReadySeconds, true)()
+	set := newStatefulSet(3)
+	status := apps.StatefulSetStatus{ObservedGeneration: 1, Replicas: 2, AvailableReplicas: 3}
+	fakeClient := &fake.Clientset{}
+	updater := NewRealStatefulSetStatusUpdater(fakeClient, nil)
+	fakeClient.AddReactor("update", "statefulsets", func(action core.Action) (bool, runtime.Object, error) {
+		update := action.(core.UpdateAction)
+		return true, update.GetObject(), nil
+	})
+	if err := updater.UpdateStatefulSetStatus(set, &status); err != nil {
+		t.Errorf("Error returned on successful status update: %s", err)
+	}
+	if set.Status.AvailableReplicas != 3 {
+		t.Errorf("UpdateStatefulSetStatus mutated the sets replicas %d", set.Status.AvailableReplicas)
 	}
 }

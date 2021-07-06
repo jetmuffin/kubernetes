@@ -19,20 +19,25 @@ package upgrade
 import (
 	"io"
 	"io/ioutil"
+	"os"
 
-	"github.com/pkg/errors"
-	"github.com/pmezard/go-difflib/difflib"
-	"github.com/spf13/cobra"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/version"
-	"k8s.io/klog"
-	kubeadmapiv1beta1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta1"
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/controlplane"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
 	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
+	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/version"
+	client "k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
+
+	"github.com/pkg/errors"
+	"github.com/pmezard/go-difflib/difflib"
+	"github.com/spf13/cobra"
 )
 
 type diffFlags struct {
@@ -41,6 +46,7 @@ type diffFlags struct {
 	schedulerManifestPath         string
 	newK8sVersionStr              string
 	contextLines                  int
+	kubeConfigPath                string
 	cfgPath                       string
 	out                           io.Writer
 }
@@ -51,21 +57,29 @@ var (
 	defaultSchedulerManifestPath         = constants.GetStaticPodFilepath(constants.KubeScheduler, constants.GetStaticPodDirectory())
 )
 
-// NewCmdDiff returns the cobra command for `kubeadm upgrade diff`
-func NewCmdDiff(out io.Writer) *cobra.Command {
+// newCmdDiff returns the cobra command for `kubeadm upgrade diff`
+func newCmdDiff(out io.Writer) *cobra.Command {
 	flags := &diffFlags{
-		out: out,
+		kubeConfigPath: constants.GetAdminKubeConfigPath(),
+		out:            out,
 	}
 
 	cmd := &cobra.Command{
 		Use:   "diff [version]",
 		Short: "Show what differences would be applied to existing static pod manifests. See also: kubeadm upgrade apply --dry-run",
-		Run: func(cmd *cobra.Command, args []string) {
-			// TODO: Run preflight checks for diff to check that the manifests already exist.
-			kubeadmutil.CheckErr(runDiff(flags, args))
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Run preflight checks for diff to check that the manifests already exist.
+			if err := validateManifestsPath(
+				flags.apiServerManifestPath,
+				flags.controllerManagerManifestPath,
+				flags.schedulerManifestPath); err != nil {
+				return err
+			}
+			return runDiff(flags, args)
 		},
 	}
 
+	options.AddKubeConfigFlag(cmd.Flags(), &flags.kubeConfigPath)
 	options.AddConfigFlag(cmd.Flags(), &flags.cfgPath)
 	cmd.Flags().StringVar(&flags.apiServerManifestPath, "api-server-manifest", defaultAPIServerManifestPath, "path to API server manifest")
 	cmd.Flags().StringVar(&flags.controllerManagerManifestPath, "controller-manager-manifest", defaultControllerManagerManifestPath, "path to controller manifest")
@@ -75,15 +89,43 @@ func NewCmdDiff(out io.Writer) *cobra.Command {
 	return cmd
 }
 
-func runDiff(flags *diffFlags, args []string) error {
+func validateManifestsPath(manifests ...string) (err error) {
+	for _, manifestPath := range manifests {
+		if len(manifestPath) == 0 {
+			return errors.New("empty manifest path")
+		}
+		s, err := os.Stat(manifestPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return errors.Wrapf(err, "the manifest file %q does not exist", manifestPath)
+			}
+			return errors.Wrapf(err, "error obtaining stats for manifest file %q", manifestPath)
+		}
+		if s.IsDir() {
+			return errors.Errorf("%q is a directory", manifestPath)
+		}
+	}
+	return nil
+}
 
-	// If the version is specified in config file, pick up that value.
-	klog.V(1).Infof("fetching configuration from file %s", flags.cfgPath)
-	cfg, err := configutil.ConfigFileAndDefaultsToInternalConfig(flags.cfgPath, &kubeadmapiv1beta1.InitConfiguration{})
+func runDiff(flags *diffFlags, args []string) error {
+	var err error
+	var cfg *kubeadmapi.InitConfiguration
+	if flags.cfgPath != "" {
+		cfg, err = configutil.LoadInitConfigurationFromFile(flags.cfgPath)
+	} else {
+		var client *client.Clientset
+		client, err = kubeconfigutil.ClientSetFromFile(flags.kubeConfigPath)
+		if err != nil {
+			return errors.Wrapf(err, "couldn't create a Kubernetes client from file %q", flags.kubeConfigPath)
+		}
+		cfg, err = configutil.FetchInitConfigurationFromCluster(client, flags.out, "upgrade/diff", false, false)
+	}
 	if err != nil {
 		return err
 	}
 
+	// If the version is specified in config file, pick up that value.
 	if cfg.KubernetesVersion != "" {
 		flags.newK8sVersionStr = cfg.KubernetesVersion
 	}
@@ -100,12 +142,14 @@ func runDiff(flags *diffFlags, args []string) error {
 		flags.newK8sVersionStr = args[0]
 	}
 
-	k8sVer, err := version.ParseSemantic(flags.newK8sVersionStr)
+	_, err = version.ParseSemantic(flags.newK8sVersionStr)
 	if err != nil {
 		return err
 	}
 
-	specs := controlplane.GetStaticPodSpecs(cfg, k8sVer)
+	cfg.ClusterConfiguration.KubernetesVersion = flags.newK8sVersionStr
+
+	specs := controlplane.GetStaticPodSpecs(&cfg.ClusterConfiguration, &cfg.LocalAPIEndpoint)
 	for spec, pod := range specs {
 		var path string
 		switch spec {

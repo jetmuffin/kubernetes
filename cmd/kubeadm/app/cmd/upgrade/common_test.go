@@ -18,10 +18,53 @@ package upgrade
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 )
+
+func TestEnforceRequirements(t *testing.T) {
+	tcases := []struct {
+		name          string
+		newK8sVersion string
+		dryRun        bool
+		flags         applyPlanFlags
+		expectedErr   bool
+	}{
+		{
+			name:        "Fail pre-flight check",
+			expectedErr: true,
+		},
+		{
+			name: "Bogus preflight check disabled when also 'all' is specified",
+			flags: applyPlanFlags{
+				ignorePreflightErrors: []string{"bogusvalue", "all"},
+			},
+			expectedErr: true,
+		},
+		{
+			name: "Fail to create client",
+			flags: applyPlanFlags{
+				ignorePreflightErrors: []string{"all"},
+			},
+			expectedErr: true,
+		},
+	}
+	for _, tt := range tcases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, err := enforceRequirements(&tt.flags, nil, tt.dryRun, false)
+
+			if err == nil && tt.expectedErr {
+				t.Error("Expected error, but got success")
+			}
+			if err != nil && !tt.expectedErr {
+				t.Errorf("Unexpected error: %+v", err)
+			}
+		})
+	}
+}
 
 func TestPrintConfiguration(t *testing.T) {
 	var tests = []struct {
@@ -44,30 +87,20 @@ func TestPrintConfiguration(t *testing.T) {
 						DataDir: "/some/path",
 					},
 				},
-				DNS: kubeadmapi.DNS{
-					Type: kubeadmapi.CoreDNS,
-				},
 			},
-			expectedBytes: []byte(`[upgrade/config] Configuration used:
+			expectedBytes: []byte(fmt.Sprintf(`[upgrade/config] Configuration used:
 	apiServer: {}
-	apiVersion: kubeadm.k8s.io/v1beta1
-	certificatesDir: ""
-	controlPlaneEndpoint: ""
+	apiVersion: %s
 	controllerManager: {}
-	dns:
-	  type: CoreDNS
+	dns: {}
 	etcd:
 	  local:
 	    dataDir: /some/path
-	imageRepository: ""
 	kind: ClusterConfiguration
 	kubernetesVersion: v1.7.1
-	networking:
-	  dnsDomain: ""
-	  podSubnet: ""
-	  serviceSubnet: ""
+	networking: {}
 	scheduler: {}
-`),
+`, kubeadmapiv1.SchemeGroupVersion.String())),
 		},
 		{
 			name: "cluster config with ServiceSubnet and external Etcd",
@@ -81,18 +114,12 @@ func TestPrintConfiguration(t *testing.T) {
 						Endpoints: []string{"https://one-etcd-instance:2379"},
 					},
 				},
-				DNS: kubeadmapi.DNS{
-					Type: kubeadmapi.CoreDNS,
-				},
 			},
 			expectedBytes: []byte(`[upgrade/config] Configuration used:
 	apiServer: {}
-	apiVersion: kubeadm.k8s.io/v1beta1
-	certificatesDir: ""
-	controlPlaneEndpoint: ""
+	apiVersion: ` + kubeadmapiv1.SchemeGroupVersion.String() + `
 	controllerManager: {}
-	dns:
-	  type: CoreDNS
+	dns: {}
 	etcd:
 	  external:
 	    caFile: ""
@@ -100,12 +127,9 @@ func TestPrintConfiguration(t *testing.T) {
 	    endpoints:
 	    - https://one-etcd-instance:2379
 	    keyFile: ""
-	imageRepository: ""
 	kind: ClusterConfiguration
 	kubernetesVersion: v1.7.1
 	networking:
-	  dnsDomain: ""
-	  podSubnet: ""
 	  serviceSubnet: 10.96.0.1/12
 	scheduler: {}
 `),

@@ -1,3 +1,5 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 # Disable inheritance as this is an api owners file
 options:
   no_parent_owners: true
@@ -5,6 +7,7 @@ approvers:
 - api-approvers
 reviewers:
 - api-reviewers
-- sig-scheduling
+- sig-scheduling-api-reviewers
+- sig-scheduling-api-approvers
 labels:
 - kind/api-change

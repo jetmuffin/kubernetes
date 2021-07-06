@@ -18,8 +18,11 @@ package discovery
 
 import (
 	"testing"
+	"time"
 
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestFor(t *testing.T) {
@@ -69,7 +72,9 @@ func TestFor(t *testing.T) {
 	}
 	for _, rt := range tests {
 		t.Run(rt.name, func(t *testing.T) {
-			_, actual := For(&rt.d)
+			config := rt.d
+			config.Discovery.Timeout = &metav1.Duration{Duration: 5 * time.Minute}
+			_, actual := For(&config)
 			if (actual == nil) != rt.expect {
 				t.Errorf(
 					"failed For:\n\texpected: %t\n\t  actual: %t",

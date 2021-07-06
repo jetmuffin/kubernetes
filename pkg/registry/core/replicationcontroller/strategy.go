@@ -41,6 +41,7 @@ import (
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/helper"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
+	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // rcStrategy implements verification logic for Replication Controllers.
@@ -73,6 +74,18 @@ func (rcStrategy) NamespaceScoped() bool {
 	return true
 }
 
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (rcStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
+}
+
 // PrepareForCreate clears the status of a replication controller before creation.
 func (rcStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	controller := obj.(*api.ReplicationController)
@@ -80,9 +93,7 @@ func (rcStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 
 	controller.Generation = 1
 
-	if controller.Spec.Template != nil {
-		pod.DropDisabledFields(&controller.Spec.Template.Spec, nil)
-	}
+	pod.DropDisabledTemplateFields(controller.Spec.Template, nil)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
@@ -92,16 +103,7 @@ func (rcStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object)
 	// update is not allowed to set status
 	newController.Status = oldController.Status
 
-	var newSpec, oldSpec *api.PodSpec
-	if oldController.Spec.Template != nil {
-		oldSpec = &oldController.Spec.Template.Spec
-	}
-	if newController.Spec.Template != nil {
-		newSpec = &newController.Spec.Template.Spec
-	} else {
-		newSpec = &api.PodSpec{}
-	}
-	pod.DropDisabledFields(newSpec, oldSpec)
+	pod.DropDisabledTemplateFields(newController.Spec.Template, oldController.Spec.Template)
 
 	// Any changes to the spec increment the generation number, any changes to the
 	// status should reflect the generation number of the corresponding object. We push
@@ -119,7 +121,14 @@ func (rcStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object)
 // Validate validates a new replication controller.
 func (rcStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	controller := obj.(*api.ReplicationController)
-	return validation.ValidateReplicationController(controller)
+	opts := pod.GetValidationOptionsFromPodTemplate(controller.Spec.Template, nil)
+	return validation.ValidateReplicationController(controller, opts)
+}
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (rcStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	newRC := obj.(*api.ReplicationController)
+	return pod.GetWarningsForPodTemplate(ctx, field.NewPath("template"), newRC.Spec.Template, nil)
 }
 
 // Canonicalize normalizes the object after validation.
@@ -137,8 +146,9 @@ func (rcStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) f
 	oldRc := old.(*api.ReplicationController)
 	newRc := obj.(*api.ReplicationController)
 
-	validationErrorList := validation.ValidateReplicationController(newRc)
-	updateErrorList := validation.ValidateReplicationControllerUpdate(newRc, oldRc)
+	opts := pod.GetValidationOptionsFromPodTemplate(newRc.Spec.Template, oldRc.Spec.Template)
+	validationErrorList := validation.ValidateReplicationController(newRc, opts)
+	updateErrorList := validation.ValidateReplicationControllerUpdate(newRc, oldRc, opts)
 	errs := append(validationErrorList, updateErrorList...)
 
 	for key, value := range helper.NonConvertibleFields(oldRc.Annotations) {
@@ -161,6 +171,17 @@ func (rcStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) f
 	return errs
 }
 
+// WarningsOnUpdate returns warnings for the given update.
+func (rcStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	var warnings []string
+	oldRc := old.(*api.ReplicationController)
+	newRc := obj.(*api.ReplicationController)
+	if oldRc.Generation != newRc.Generation {
+		warnings = pod.GetWarningsForPodTemplate(ctx, field.NewPath("spec", "template"), oldRc.Spec.Template, newRc.Spec.Template)
+	}
+	return warnings
+}
+
 func (rcStrategy) AllowUnconditionalUpdate() bool {
 	return true
 }
@@ -175,12 +196,12 @@ func ControllerToSelectableFields(controller *api.ReplicationController) fields.
 }
 
 // GetAttrs returns labels and fields of a given object for filtering purposes.
-func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
+func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
 	rc, ok := obj.(*api.ReplicationController)
 	if !ok {
-		return nil, nil, false, fmt.Errorf("given object is not a replication controller.")
+		return nil, nil, fmt.Errorf("given object is not a replication controller")
 	}
-	return labels.Set(rc.ObjectMeta.Labels), ControllerToSelectableFields(rc), rc.Initializers != nil, nil
+	return labels.Set(rc.ObjectMeta.Labels), ControllerToSelectableFields(rc), nil
 }
 
 // MatchController is the filter used by the generic etcd backend to route
@@ -198,7 +219,18 @@ type rcStatusStrategy struct {
 	rcStrategy
 }
 
+// StatusStrategy is the default logic invoked when updating object status.
 var StatusStrategy = rcStatusStrategy{Strategy}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (rcStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return map[fieldpath.APIVersion]*fieldpath.Set{
+		"v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+}
 
 func (rcStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newRc := obj.(*api.ReplicationController)
@@ -209,4 +241,9 @@ func (rcStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.O
 
 func (rcStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	return validation.ValidateReplicationControllerStatusUpdate(obj.(*api.ReplicationController), old.(*api.ReplicationController))
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (rcStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }
